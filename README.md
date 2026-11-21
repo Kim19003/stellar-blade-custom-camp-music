@@ -4,6 +4,9 @@ Add your own custom songs to **Stellar Blade's Camp Turntable** — complete wit
 
 No Unreal Engine installation or `pip install` dependencies are required.
 
+> [!NOTE]
+> **AI-Assisted Development**: AI was heavily used throughout this project (including reverse-engineering analysis, UE4 IoStore/Zen asset synthesis, GUI/CLI code, and documentation). Please review the code before running it if you have security concerns.
+
 ---
 
 ## Features
