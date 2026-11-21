@@ -1,0 +1,15 @@
+Context/
+.cache/
+dist/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+Music/*
+!Music/.gitkeep
+Thumbs.db
+desktop.ini
+.DS_Store
+*.pak
+*.utoc
+*.ucas
