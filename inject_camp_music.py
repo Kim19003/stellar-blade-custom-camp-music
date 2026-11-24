@@ -14,7 +14,9 @@ import ctypes
 import dataclasses
 import hashlib
 import io
+import math
 import pathlib
+import random
 import re
 import shutil
 import struct
@@ -652,6 +654,7 @@ ALBUM_COVER_PRESETS: List[Tuple[str, str]] = [
 DEFAULT_ALBUM_COVER = ALBUM_COVER_PRESETS[0][1]
 TURNTABLE_SOUND_TABLE_PKG = "/Game/Local/Data/TurntableSoundTable"
 STRING_TABLE_UI_PKG = "/Game/Local/Localize/StringTable_UI"
+DEFAULT_VISUALIZER_MAX_MINUTES = 20.0
 
 
 @dataclasses.dataclass
@@ -665,6 +668,23 @@ class CustomTrackInput:
     image_path: str = DEFAULT_ALBUM_COVER
     cover_bgra: Optional[bytes] = None
     cover_label: str = ""
+    disable_visualizer: bool = False
+
+
+@dataclasses.dataclass
+class RadioStationInput:
+    """Configuration for a folder-based shuffled Camp Radio station."""
+    station_dir: pathlib.Path
+    title: str = ""
+    variants: int = 1
+    silence_sec: float = 0.5
+    volume_on: float = 1.100000023841858
+    volume_off: float = 0.6000000238418579
+    image_path: str = DEFAULT_ALBUM_COVER
+    custom_cover_file: Optional[pathlib.Path] = None
+    use_first_song_art: bool = True
+    visualizer_mode: str = "auto"  # "auto" | "on" | "off"
+    visualizer_max_minutes: float = DEFAULT_VISUALIZER_MAX_MINUTES
 
 
 def _parse_flac_picture_block(block: bytes) -> Optional[Tuple[int, bytes]]:
@@ -1208,6 +1228,48 @@ def parse_ogg_vorbis(ogg_bytes: bytes) -> OggVorbisInfo:
         sample_rate=sample_rate,
         total_samples=total_samples,
     )
+
+
+def probe_ogg_duration(ogg_path: pathlib.Path) -> Tuple[int, int, float]:
+    """
+    Fast head+tail read of an .ogg file to extract (channels, sample_rate, duration_sec)
+    without loading the entire file into memory.
+    """
+    fsize = ogg_path.stat().st_size
+    with ogg_path.open("rb") as f:
+        head = f.read(min(65536, fsize))
+        if fsize <= 65536:
+            tail = head
+        else:
+            f.seek(max(0, fsize - 65536))
+            tail = f.read(65536)
+
+    if len(head) < 64 or head[:4] != b"OggS":
+        raise ValueError("Not a valid Ogg container.")
+    vorbis_pos = head.find(b"\x01vorbis")
+    if vorbis_pos == -1 or vorbis_pos + 16 > len(head):
+        raise ValueError("Missing Vorbis identification header.")
+    channels = head[vorbis_pos + 11]
+    sample_rate = struct.unpack_from("<I", head, vorbis_pos + 12)[0]
+    if channels <= 0 or sample_rate <= 0:
+        raise ValueError("Invalid Vorbis audio parameters.")
+
+    total_samples = 0
+    pos = len(tail) - 27
+    while pos >= 0:
+        idx = tail.rfind(b"OggS", 0, pos + 1)
+        if idx == -1:
+            break
+        if idx + 27 <= len(tail) and tail[idx + 4] == 0:
+            granule = struct.unpack_from("<q", tail, idx + 6)[0]
+            if granule > 0:
+                total_samples = granule
+                break
+        pos = idx - 1
+
+    if total_samples <= 0:
+        raise ValueError("Could not determine total sample count from OggS granule positions.")
+    return channels, sample_rate, total_samples / float(sample_rate)
 
 
 def _ogg_has_image_or_extra_streams(raw: bytes) -> Optional[str]:
@@ -1786,8 +1848,14 @@ def build_qnrt_zen_asset(
     ch0_templates: List[bytes],
     ch1_templates: List[bytes],
     intervals_trailer: bytes,
+    disable_visualizer: bool = False,
 ) -> bytes:
-    """Build a duration-matched UE 4.26 Zen UConstantQNRT package (_ON_NRT.uasset in .ucas)."""
+    """
+    Build a duration-matched UE 4.26 Zen UConstantQNRT package (_ON_NRT.uasset in .ucas).
+
+    When `disable_visualizer` is True, emits a minimal 1-frame silent CQT asset (~1.2 KB)
+    while keeping DurationInSeconds and asset references valid.
+    """
     names = list(QNRT_BASE_NAMES)
     names[0] = on_pkg
     names[1] = nrt_pkg
@@ -1854,15 +1922,24 @@ def build_qnrt_zen_asset(
     cqt_buf.extend(struct.pack("<IfII", 0, ogg_info.duration, 1, 2))
 
     sr_f = float(ogg_info.sample_rate)
-    for ch_idx, tmpl_list in ((0, ch0_templates), (1, ch1_templates)):
-        cqt_buf.extend(struct.pack("<II", ch_idx, num_frames))
-        t_len = len(tmpl_list)
-        for i in range(num_frames):
-            ts = (fft_half + i * hop_samples) / sr_f
-            cqt_buf.extend(struct.pack("<IfI", ch_idx, ts, 48))
-            cqt_buf.extend(tmpl_list[i % t_len])
+    if disable_visualizer:
+        silent_frame = struct.pack("<48f", *([-90.0] * 48))
+        ts0 = fft_half / sr_f
+        for ch_idx in (0, 1):
+            cqt_buf.extend(struct.pack("<II", ch_idx, 1))
+            cqt_buf.extend(struct.pack("<IfI", ch_idx, ts0, 48))
+            cqt_buf.extend(silent_frame)
+        cqt_buf.extend(struct.pack("<Iiffiff", 2, 0, -90.0, -90.0, 1, -90.0, -90.0))
+    else:
+        for ch_idx, tmpl_list in ((0, ch0_templates), (1, ch1_templates)):
+            cqt_buf.extend(struct.pack("<II", ch_idx, num_frames))
+            t_len = len(tmpl_list)
+            for i in range(num_frames):
+                ts = (fft_half + i * hop_samples) / sr_f
+                cqt_buf.extend(struct.pack("<IfI", ch_idx, ts, 48))
+                cqt_buf.extend(tmpl_list[i % t_len])
 
-    cqt_buf.extend(intervals_trailer)
+        cqt_buf.extend(intervals_trailer)
     export0_payload = bytes(props) + bytes(cqt_buf)
     export1_payload = struct.pack("<3I", 15, 0, 0)  # FName("None") + bSerializeGuid=0
 
@@ -2847,6 +2924,7 @@ def build_custom_music_mod(
             ch0_templates=ch0_tmpl,
             ch1_templates=ch1_tmpl,
             intervals_trailer=intervals_trailer,
+            disable_visualizer=trk.disable_visualizer,
         )
 
         audio_pkg_chunks.append((off_pkg, off_id, 1, 1, next_load_order, imp_soundwave, uasset_off))
@@ -2934,38 +3012,22 @@ def scan_music_folder(music_dir: pathlib.Path) -> List[pathlib.Path]:
     return audio_files
 
 
-def build_custom_music_from_folder(
+def prepare_custom_tracks_from_folder(
     music_dir: pathlib.Path,
-    output_dir: Optional[pathlib.Path] = None,
-    mod_name: str = "CampMusic_Custom_295_P",
-    game_dir: Optional[pathlib.Path] = None,
-    install: bool = False,
     volume_on: float = 1.100000023841858,
     volume_off: float = 0.6000000238418579,
     image_path: str = DEFAULT_ALBUM_COVER,
     custom_image_file: Optional[pathlib.Path] = None,
     use_embedded_art: bool = True,
     reencode: bool = False,
-    template_ucas_path: Optional[pathlib.Path] = None,
-    cache_dir: Optional[pathlib.Path] = None,
     progress_callback: Optional[Callable[[int, int, pathlib.Path, str], None]] = None,
-) -> Tuple[List[CustomTrackInput], pathlib.Path, pathlib.Path, pathlib.Path]:
-    """
-    Bundle all audio files in `music_dir` into a single combined mod that keeps all
-    34 original Camp Turntable tracks intact.
-    """
+) -> List[CustomTrackInput]:
+    """Scan `music_dir` (non-recursively) and encode/prepare `CustomTrackInput` entries."""
     audio_files = scan_music_folder(music_dir)
     if not audio_files:
         raise ValueError(
             f"No supported audio files ({', '.join(sorted(SUPPORTED_AUDIO_EXTENSIONS))}) found in {music_dir}"
         )
-
-    if install:
-        if game_dir is None:
-            raise ValueError("game_dir is required when install is True.")
-        final_out_dir = game_dir / "SB" / "Content" / "Paks" / "~mods"
-    else:
-        final_out_dir = output_dir or (music_dir.parent / "dist")
 
     custom_tracks: List[CustomTrackInput] = []
     total = len(audio_files)
@@ -2994,6 +3056,46 @@ def build_custom_music_from_folder(
                 cover_label=cover_lbl,
             )
         )
+    return custom_tracks
+
+
+def build_custom_music_from_folder(
+    music_dir: pathlib.Path,
+    output_dir: Optional[pathlib.Path] = None,
+    mod_name: str = "CampMusic_Custom_295_P",
+    game_dir: Optional[pathlib.Path] = None,
+    install: bool = False,
+    volume_on: float = 1.100000023841858,
+    volume_off: float = 0.6000000238418579,
+    image_path: str = DEFAULT_ALBUM_COVER,
+    custom_image_file: Optional[pathlib.Path] = None,
+    use_embedded_art: bool = True,
+    reencode: bool = False,
+    template_ucas_path: Optional[pathlib.Path] = None,
+    cache_dir: Optional[pathlib.Path] = None,
+    progress_callback: Optional[Callable[[int, int, pathlib.Path, str], None]] = None,
+) -> Tuple[List[CustomTrackInput], pathlib.Path, pathlib.Path, pathlib.Path]:
+    """
+    Bundle all audio files in `music_dir` into a single combined mod that keeps all
+    34 original Camp Turntable tracks intact.
+    """
+    if install:
+        if game_dir is None:
+            raise ValueError("game_dir is required when install is True.")
+        final_out_dir = game_dir / "SB" / "Content" / "Paks" / "~mods"
+    else:
+        final_out_dir = output_dir or (music_dir.parent / "dist")
+
+    custom_tracks = prepare_custom_tracks_from_folder(
+        music_dir=music_dir,
+        volume_on=volume_on,
+        volume_off=volume_off,
+        image_path=image_path,
+        custom_image_file=custom_image_file,
+        use_embedded_art=use_embedded_art,
+        reencode=reencode,
+        progress_callback=progress_callback,
+    )
 
     pak_p, utoc_p, ucas_p = build_custom_music_mod(
         tracks=custom_tracks,
@@ -3004,6 +3106,338 @@ def build_custom_music_from_folder(
         cache_dir=cache_dir,
     )
     return custom_tracks, pak_p, utoc_p, ucas_p
+
+
+# ============================================================================
+# 7. Camp Radio / Pre-Shuffled Station Builder
+# ============================================================================
+
+def should_disable_visualizer(
+    duration_sec: float,
+    visualizer_mode: str = "auto",
+    max_minutes: float = DEFAULT_VISUALIZER_MAX_MINUTES,
+) -> bool:
+    """Decide whether to emit a minimal silent UConstantQNRT instead of full CQT frames."""
+    mode = (visualizer_mode or "auto").strip().lower()
+    if mode in ("off", "false", "0", "disabled", "no"):
+        return True
+    if mode in ("on", "true", "1", "enabled", "yes"):
+        return False
+    return duration_sec > (max_minutes * 60.0)
+
+
+def find_radio_folder_cover(station_dir: pathlib.Path) -> Optional[pathlib.Path]:
+    """
+    Locate a cover image inside `station_dir`, prioritizing common names
+    ('cover', 'folder', 'album', 'artwork', 'front', or the folder's own name).
+    """
+    if not station_dir.is_dir():
+        return None
+    images = [
+        p for p in station_dir.iterdir()
+        if p.is_file()
+        and p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+        and not p.name.startswith(".")
+    ]
+    if not images:
+        return None
+    images.sort(key=natural_sort_key)
+    preferred_stems = {"cover", "folder", "album", "artwork", "front", station_dir.name.lower()}
+    for p in images:
+        if p.stem.lower() in preferred_stems:
+            return p
+    return images[0]
+
+
+def resolve_radio_cover_art(
+    station_dir: pathlib.Path,
+    songs: List[pathlib.Path],
+    fallback_image_path: str = DEFAULT_ALBUM_COVER,
+    custom_image_file: Optional[pathlib.Path] = None,
+    use_first_song_art: bool = True,
+) -> Tuple[str, Optional[bytes], str]:
+    """
+    Resolve album cover art for a radio station with priority:
+      1. Explicit custom image file override
+      2. Image file located inside `station_dir`
+      3. Embedded cover art from the first song in `songs`
+      4. Vanilla preset fallback
+    """
+    if custom_image_file is not None and custom_image_file.is_file():
+        return (
+            fallback_image_path,
+            prepare_cover_art_bgra(custom_image_file),
+            f"image '{custom_image_file.name}'",
+        )
+
+    folder_cover = find_radio_folder_cover(station_dir)
+    if folder_cover is not None:
+        return (
+            fallback_image_path,
+            prepare_cover_art_bgra(folder_cover),
+            f"folder image '{folder_cover.name}'",
+        )
+
+    if use_first_song_art and songs:
+        embedded = extract_embedded_cover_art(songs[0])
+        if embedded:
+            return (
+                fallback_image_path,
+                prepare_cover_art_bgra(embedded),
+                f"1st song embedded art ({songs[0].name})",
+            )
+
+    preset_name = fallback_image_path
+    for label, path_str in ALBUM_COVER_PRESETS:
+        if path_str == fallback_image_path:
+            preset_name = label
+            break
+    return fallback_image_path, None, f"preset '{preset_name}'"
+
+
+def scan_radio_folder(station_dir: pathlib.Path) -> Tuple[List[pathlib.Path], Optional[pathlib.Path]]:
+    """Return naturally sorted audio files and optional folder cover image for a radio folder."""
+    songs = scan_music_folder(station_dir)
+    cover_img = find_radio_folder_cover(station_dir)
+    return songs, cover_img
+
+
+def discover_radio_station_dirs(parent_dir: pathlib.Path) -> List[pathlib.Path]:
+    """Find immediate subdirectories of `parent_dir` containing supported audio files."""
+    if not parent_dir.is_dir():
+        return []
+    stations: List[pathlib.Path] = []
+    for sub in sorted(parent_dir.iterdir(), key=natural_sort_key):
+        if not sub.is_dir() or sub.name.startswith("."):
+            continue
+        if scan_music_folder(sub):
+            stations.append(sub)
+    return stations
+
+
+def generate_shuffled_playlists(
+    songs: List[pathlib.Path],
+    variants: int,
+    rng: Optional[random.Random] = None,
+) -> List[List[pathlib.Path]]:
+    """
+    Generate `variants` randomly shuffled copies of `songs`, avoiding duplicate
+    permutations across variants when enough unique permutations exist.
+    """
+    if not songs:
+        raise ValueError("Cannot shuffle an empty song list.")
+    if variants < 1:
+        raise ValueError("variants must be at least 1.")
+
+    r = rng or random.Random()
+    max_unique = math.factorial(len(songs)) if len(songs) <= 7 else 10**9
+    seen: set = set()
+    playlists: List[List[pathlib.Path]] = []
+
+    for _ in range(variants):
+        chosen: Optional[List[pathlib.Path]] = None
+        for _ in range(24):
+            cand = list(songs)
+            r.shuffle(cand)
+            key = tuple(cand)
+            if key not in seen or len(seen) >= max_unique:
+                chosen = cand
+                seen.add(key)
+                break
+        if chosen is None:
+            chosen = list(songs)
+            r.shuffle(chosen)
+        playlists.append(chosen)
+
+    return playlists
+
+
+def build_radio_filter_script(num_inputs: int, silence_sec: float = 0.0) -> Tuple[str, str]:
+    """
+    Build an FFmpeg filter_complex script normalizing `num_inputs` audio streams to
+    48000 Hz stereo and concatenating them with optional `silence_sec` gaps.
+    """
+    if num_inputs < 1:
+        raise ValueError("num_inputs must be >= 1.")
+
+    lines: List[str] = []
+    for i in range(num_inputs):
+        lines.append(f"[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}];")
+
+    concat_inputs: List[str] = []
+    if silence_sec > 0.0 and num_inputs > 1:
+        for i in range(num_inputs):
+            concat_inputs.append(f"[a{i}]")
+            if i < num_inputs - 1:
+                lines.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={silence_sec:.4f}[s{i}];")
+                concat_inputs.append(f"[s{i}]")
+    else:
+        for i in range(num_inputs):
+            concat_inputs.append(f"[a{i}]")
+
+    lines.append(f"{''.join(concat_inputs)}concat=n={len(concat_inputs)}:v=0:a=1[outa]")
+    return "\n".join(lines), "[outa]"
+
+
+def build_shuffled_radio_ogg(
+    ordered_songs: List[pathlib.Path],
+    silence_sec: float = 0.5,
+    quality: int = 4,
+) -> OggVorbisInfo:
+    """
+    Combine and encode `ordered_songs` into one continuous 48000 Hz stereo Ogg Vorbis
+    bitstream using FFmpeg, inserting `silence_sec` seconds of silence between songs.
+    """
+    if not ordered_songs:
+        raise ValueError("ordered_songs cannot be empty.")
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError(
+            "FFmpeg ('ffmpeg.exe') was not found on PATH.\n"
+            "Combining and shuffling songs into a single Ogg Vorbis radio stream requires FFmpeg."
+        )
+
+    filter_script, out_pad = build_radio_filter_script(len(ordered_songs), silence_sec=silence_sec)
+
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".ffscript", delete=False) as sf:
+        sf.write(filter_script)
+        script_path = pathlib.Path(sf.name)
+
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tf:
+        out_ogg_path = pathlib.Path(tf.name)
+
+    try:
+        cmd: List[str] = [ffmpeg, "-y"]
+        for song in ordered_songs:
+            cmd.extend(["-i", str(song)])
+        cmd.extend([
+            "-filter_complex_script", str(script_path),
+            "-map", out_pad,
+            "-vn", "-sn", "-dn", "-map_metadata", "-1",
+            "-c:a", "libvorbis", "-ar", "48000", "-ac", "2", "-q:a", str(quality),
+            str(out_ogg_path),
+        ])
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            err_tail = proc.stderr.decode("utf-8", errors="replace")[-1200:]
+            raise RuntimeError(f"FFmpeg failed while building radio mix (exit {proc.returncode}):\n{err_tail}")
+        return parse_ogg_vorbis(out_ogg_path.read_bytes())
+    finally:
+        script_path.unlink(missing_ok=True)
+        out_ogg_path.unlink(missing_ok=True)
+
+
+def prepare_radio_tracks(
+    stations: List[RadioStationInput],
+    seed: Optional[int] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> Tuple[List[CustomTrackInput], List[Tuple[str, List[pathlib.Path]]]]:
+    """
+    Build pre-shuffled `CustomTrackInput` entries for all radio stations and variants,
+    returning `(radio_tracks, variant_logs)`.
+    """
+    if not stations:
+        return [], []
+
+    rng = random.Random(seed)
+    radio_tracks: List[CustomTrackInput] = []
+    variant_logs: List[Tuple[str, List[pathlib.Path]]] = []
+
+    total_variants = sum(max(1, st.variants) for st in stations)
+    done_variants = 0
+
+    for st in stations:
+        songs = scan_music_folder(st.station_dir)
+        if not songs:
+            raise ValueError(f"No supported audio files found in radio folder: {st.station_dir}")
+
+        base_title = st.title.strip() or clean_title_from_stem(st.station_dir.name)
+        img_fallback, cover_bgra, cover_lbl = resolve_radio_cover_art(
+            station_dir=st.station_dir,
+            songs=songs,
+            fallback_image_path=st.image_path,
+            custom_image_file=st.custom_cover_file,
+            use_first_song_art=st.use_first_song_art,
+        )
+
+        n_variants = max(1, int(st.variants))
+        shuffled_sets = generate_shuffled_playlists(songs, n_variants, rng=rng)
+
+        for v_idx, ordered_songs in enumerate(shuffled_sets, start=1):
+            done_variants += 1
+            variant_title = base_title if n_variants == 1 else f"{base_title} #{v_idx}"
+            if progress_callback:
+                progress_callback(
+                    f"[{done_variants}/{total_variants}] Encoding {variant_title!r} "
+                    f"({len(ordered_songs)} songs, {st.silence_sec:.1f}s gap)..."
+                )
+
+            ogg_mix = build_shuffled_radio_ogg(
+                ordered_songs=ordered_songs,
+                silence_sec=max(0.0, float(st.silence_sec)),
+            )
+            disable_vis = should_disable_visualizer(
+                ogg_mix.duration,
+                visualizer_mode=st.visualizer_mode,
+                max_minutes=st.visualizer_max_minutes,
+            )
+            radio_tracks.append(
+                CustomTrackInput(
+                    title=variant_title,
+                    ogg_on=ogg_mix,
+                    ogg_off=ogg_mix,
+                    volume_on=st.volume_on,
+                    volume_off=st.volume_off,
+                    image_path=img_fallback,
+                    cover_bgra=cover_bgra,
+                    cover_label=cover_lbl,
+                    disable_visualizer=disable_vis,
+                )
+            )
+            variant_logs.append((variant_title, ordered_songs))
+
+    return radio_tracks, variant_logs
+
+
+def build_radio_mod(
+    stations: List[RadioStationInput],
+    output_dir: pathlib.Path,
+    mod_name: str = "CampMusic_Radio_295_P",
+    game_dir: Optional[pathlib.Path] = None,
+    template_ucas_path: Optional[pathlib.Path] = None,
+    cache_dir: Optional[pathlib.Path] = None,
+    seed: Optional[int] = None,
+    extra_tracks: Optional[List[CustomTrackInput]] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> Tuple[List[CustomTrackInput], List[Tuple[str, List[pathlib.Path]]], pathlib.Path, pathlib.Path, pathlib.Path]:
+    """
+    Build one combined <mod_name>.{pak,utoc,ucas} containing all pre-shuffled radio
+    station variants (plus any optional `extra_tracks`) alongside all 34 original
+    Camp Turntable tracks.
+    """
+    if not stations and not extra_tracks:
+        raise ValueError("At least one radio station folder or custom track is required.")
+
+    radio_tracks, variant_logs = prepare_radio_tracks(
+        stations=stations,
+        seed=seed,
+        progress_callback=progress_callback,
+    )
+    all_tracks: List[CustomTrackInput] = list(extra_tracks or []) + radio_tracks
+
+    if progress_callback:
+        progress_callback("Packing Zen assets, TurntableSoundTable & StringTable_UI into IoStore...")
+
+    pak_p, utoc_p, ucas_p = build_custom_music_mod(
+        tracks=all_tracks,
+        output_dir=output_dir,
+        mod_name=mod_name,
+        game_dir=game_dir,
+        template_ucas_path=template_ucas_path,
+        cache_dir=cache_dir,
+    )
+    return radio_tracks, variant_logs, pak_p, utoc_p, ucas_p
 
 
 def print_tracks_table() -> None:
@@ -3039,6 +3473,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     )
     parser.add_argument("--gui", action="store_true", help="Launch the native Windows graphical user interface.")
+    parser.add_argument("--radio-gui", action="store_true", help="Launch the dedicated Windows Camp Radio & Shuffle GUI.")
     parser.add_argument("--list-tracks", action="store_true", help="List the 34 base-game Camp Turntable tracks and exit.")
     parser.add_argument("-i", "--input", action="append", type=pathlib.Path, help="Input audio file (.ogg, .wav, .mp3, .flac, etc.). Repeat -i to bundle multiple songs.")
     parser.add_argument("--input-off", action="append", type=pathlib.Path, help="Optional separate ambient (_OFF) audio file paired with each -i input.")
@@ -3046,7 +3481,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--cover", action="append", type=pathlib.Path, help="Optional custom cover art image (.png/.jpg/.webp) paired with each -i input.")
     parser.add_argument("--album-art", type=str, default=None, help="Fallback album cover preset name/number, Texture2D asset path, or image file path.")
     parser.add_argument("--no-embedded-art", action="store_true", help="Do not auto-extract embedded album art from audio files (use preset fallback unless --cover is set).")
-    parser.add_argument("-n", "--mod-name", default="CampMusic_Custom_295_P", help="Output mod base name (default: CampMusic_Custom_295_P).")
+    parser.add_argument("--radio", action="append", type=pathlib.Path, help="Radio station folder (or parent folder containing station subfolders) to shuffle & combine into one track per variant.")
+    parser.add_argument("--radio-title", action="append", type=str, help="Optional custom title paired with each --radio station.")
+    parser.add_argument("--radio-cover", action="append", type=pathlib.Path, help="Optional custom cover image paired with each --radio station.")
+    parser.add_argument("--variants", type=int, default=1, help="Number of pre-shuffled variants per radio station (default: 1).")
+    parser.add_argument("--silence", type=float, default=0.5, help="Silence duration in seconds between tracks in a radio mix (default: 0.5).")
+    parser.add_argument("--visualizer", choices=("auto", "on", "off"), default="auto", help="Turntable visualizer mode for radio mixes: auto disables above threshold (default: auto).")
+    parser.add_argument("--visualizer-threshold", type=float, default=DEFAULT_VISUALIZER_MAX_MINUTES, help="Duration threshold in minutes for --visualizer auto (default: 20.0).")
+    parser.add_argument("--seed", type=int, default=None, help="Optional random seed for reproducible radio shuffling.")
+    parser.add_argument("-n", "--mod-name", default=None, help="Output mod base name (default: CampMusic_Custom_295_P, or CampMusic_Radio_295_P in --radio mode).")
     parser.add_argument("-o", "--output-dir", type=pathlib.Path, default=root_dir / "dist", help="Output directory for .pak/.utoc/.ucas files.")
     parser.add_argument("--install", action="store_true", help="Install directly into StellarBlade/SB/Content/Paks/~mods.")
     parser.add_argument("--volume-on", type=float, default=1.100000023841858, help="Playback volume for _ON asset (default: 1.1).")
@@ -3064,10 +3507,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         import camp_music_gui
         return camp_music_gui.launch_gui()
 
+    if args.radio_gui:
+        if sys.platform != "win32":
+            parser.error("The native Windows GUI requires Windows (win32).")
+        import radio_music_gui
+        return radio_music_gui.launch_gui()
+
     if args.list_tracks:
         print_tracks_table()
         return 0
 
+    if not args.radio and args.batch is None and not args.input:
+        parser.error("the following arguments are required: -i/--input, --batch, or --radio (or use --gui / --radio-gui / --list-tracks)")
+
+    mod_name = args.mod_name or ("CampMusic_Radio_295_P" if (args.radio and args.batch is None and not args.input) else "CampMusic_Custom_295_P")
     out_dir = (args.game_dir / "SB" / "Content" / "Paks" / "~mods") if args.install else args.output_dir
     global_cover_file: Optional[pathlib.Path] = None
     if args.album_art and pathlib.Path(args.album_art).is_file():
@@ -3079,100 +3532,131 @@ def main(argv: Optional[List[str]] = None) -> int:
     tmpl_path = args.template_ucas if (args.template_ucas and args.template_ucas.is_file()) else None
     cache_dir = root_dir / ".cache"
 
+    individual_tracks: List[CustomTrackInput] = []
+
     if args.batch is not None:
         music_folder = args.batch.resolve()
         if not music_folder.is_dir():
             parser.error(f"Music directory not found: {music_folder}")
-        print(f"Adding all custom tracks from '{music_folder}' (keeping all 34 original tracks)...")
+        print(f"Adding custom tracks from '{music_folder}'...")
 
         def cli_progress(cur: int, total: int, song: pathlib.Path, title: str) -> None:
             print(f"  [{cur:02d}/{total:02d}] +{title!r} ({song.name})...")
 
-        built_tracks, pak_p, utoc_p, ucas_p = build_custom_music_from_folder(
-            music_dir=music_folder,
-            output_dir=out_dir,
-            mod_name=args.mod_name,
-            game_dir=args.game_dir,
-            install=args.install,
-            volume_on=args.volume_on,
-            volume_off=args.volume_off,
-            image_path=image_path,
-            custom_image_file=global_cover_file,
-            use_embedded_art=use_embedded_art,
-            reencode=args.reencode,
-            template_ucas_path=tmpl_path,
-            cache_dir=cache_dir,
-            progress_callback=cli_progress,
-        )
-        print(f"\nSUCCESS! Added {len(built_tracks)} custom track(s) while keeping all 34 original tracks:")
-        for idx, trk in enumerate(built_tracks, start=1):
-            cov_note = f" | Cover: {trk.cover_label}" if trk.cover_label else ""
-            print(f"  [Custom {idx:02d}] {trk.title!r} ({trk.ogg_on.duration:.2f}s{cov_note})")
-        print("  Output Files:")
-        print(f"    PAK : {pak_p} ({pak_p.stat().st_size:,} bytes)")
-        print(f"    UTOC: {utoc_p} ({utoc_p.stat().st_size:,} bytes)")
-        print(f"    UCAS: {ucas_p} ({ucas_p.stat().st_size:,} bytes)")
-        return 0
-
-    if not args.input:
-        parser.error("the following arguments are required: -i/--input or --batch (or use --gui / --list-tracks)")
-
-    inputs: List[pathlib.Path] = args.input
-    titles: List[str] = args.title or []
-    off_inputs: List[pathlib.Path] = args.input_off or []
-    cover_inputs: List[pathlib.Path] = args.cover or []
-
-    custom_tracks: List[CustomTrackInput] = []
-    for idx, song_path in enumerate(inputs):
-        song_title = titles[idx] if idx < len(titles) and titles[idx].strip() else infer_song_title(song_path)
-        cov_file = cover_inputs[idx] if idx < len(cover_inputs) else global_cover_file
-        if cov_file is not None and str(cov_file).strip().lower() in ("", "none", "auto"):
-            cov_file = None
-        img_fallback, cover_bgra, cover_lbl = resolve_track_cover_art(
-            audio_path=song_path,
-            fallback_image_path=image_path,
-            custom_image_file=cov_file,
-            use_embedded=use_embedded_art,
-        )
-        ogg_on = load_or_convert_ogg(song_path, force_reencode=args.reencode)
-        if idx < len(off_inputs):
-            ogg_off = load_or_convert_ogg(off_inputs[idx], force_reencode=args.reencode)
-        else:
-            off_cand = find_off_audio_candidate(song_path)
-            ogg_off = load_or_convert_ogg(off_cand, force_reencode=args.reencode) if off_cand else ogg_on
-        custom_tracks.append(
-            CustomTrackInput(
-                title=song_title,
-                ogg_on=ogg_on,
-                ogg_off=ogg_off,
+        individual_tracks.extend(
+            prepare_custom_tracks_from_folder(
+                music_dir=music_folder,
                 volume_on=args.volume_on,
                 volume_off=args.volume_off,
-                image_path=img_fallback,
-                cover_bgra=cover_bgra,
-                cover_label=cover_lbl,
+                image_path=image_path,
+                custom_image_file=global_cover_file,
+                use_embedded_art=use_embedded_art,
+                reencode=args.reencode,
+                progress_callback=cli_progress,
             )
         )
 
+    if args.input:
+        inputs: List[pathlib.Path] = args.input
+        titles: List[str] = args.title or []
+        off_inputs: List[pathlib.Path] = args.input_off or []
+        cover_inputs: List[pathlib.Path] = args.cover or []
+
+        for idx, song_path in enumerate(inputs):
+            song_title = titles[idx] if idx < len(titles) and titles[idx].strip() else infer_song_title(song_path)
+            cov_file = cover_inputs[idx] if idx < len(cover_inputs) else global_cover_file
+            if cov_file is not None and str(cov_file).strip().lower() in ("", "none", "auto"):
+                cov_file = None
+            img_fallback, cover_bgra, cover_lbl = resolve_track_cover_art(
+                audio_path=song_path,
+                fallback_image_path=image_path,
+                custom_image_file=cov_file,
+                use_embedded=use_embedded_art,
+            )
+            ogg_on = load_or_convert_ogg(song_path, force_reencode=args.reencode)
+            if idx < len(off_inputs):
+                ogg_off = load_or_convert_ogg(off_inputs[idx], force_reencode=args.reencode)
+            else:
+                off_cand = find_off_audio_candidate(song_path)
+                ogg_off = load_or_convert_ogg(off_cand, force_reencode=args.reencode) if off_cand else ogg_on
+            individual_tracks.append(
+                CustomTrackInput(
+                    title=song_title,
+                    ogg_on=ogg_on,
+                    ogg_off=ogg_off,
+                    volume_on=args.volume_on,
+                    volume_off=args.volume_off,
+                    image_path=img_fallback,
+                    cover_bgra=cover_bgra,
+                    cover_label=cover_lbl,
+                )
+            )
+
+    radio_tracks: List[CustomTrackInput] = []
+    variant_logs: List[Tuple[str, List[pathlib.Path]]] = []
+    if args.radio:
+        r_titles = args.radio_title or ([] if (args.input or args.batch is not None) else (args.title or []))
+        r_covers = args.radio_cover or ([] if (args.input or args.batch is not None) else (args.cover or []))
+        stations: List[RadioStationInput] = []
+        raw_station_dirs: List[pathlib.Path] = []
+        for rdir in args.radio:
+            r_resolved = rdir.resolve()
+            if not r_resolved.is_dir():
+                parser.error(f"Radio directory not found: {rdir}")
+            if scan_music_folder(r_resolved):
+                raw_station_dirs.append(r_resolved)
+            else:
+                sub_dirs = discover_radio_station_dirs(r_resolved)
+                if not sub_dirs:
+                    parser.error(f"No audio files or station subfolders with audio found in: {rdir}")
+                raw_station_dirs.extend(sub_dirs)
+
+        for idx, sdir in enumerate(raw_station_dirs):
+            st_title = r_titles[idx] if idx < len(r_titles) and r_titles[idx].strip() else clean_title_from_stem(sdir.name)
+            st_cover = r_covers[idx] if idx < len(r_covers) else global_cover_file
+            stations.append(
+                RadioStationInput(
+                    station_dir=sdir,
+                    title=st_title,
+                    variants=max(1, args.variants),
+                    silence_sec=max(0.0, args.silence),
+                    volume_on=args.volume_on,
+                    volume_off=args.volume_off,
+                    image_path=image_path,
+                    custom_cover_file=st_cover,
+                    use_first_song_art=use_embedded_art,
+                    visualizer_mode=args.visualizer,
+                    visualizer_max_minutes=args.visualizer_threshold,
+                )
+            )
+
+        print(f"Building Camp Radio tracks from {len(stations)} station(s) ({args.variants} variant(s) each, {args.silence:.2f}s gap)...")
+        radio_tracks, variant_logs = prepare_radio_tracks(
+            stations=stations,
+            seed=args.seed,
+            progress_callback=lambda msg: print(f"  {msg}"),
+        )
+
+    all_tracks = individual_tracks + radio_tracks
     pak_p, utoc_p, ucas_p = build_custom_music_mod(
-        tracks=custom_tracks,
+        tracks=all_tracks,
         output_dir=out_dir,
-        mod_name=args.mod_name,
+        mod_name=mod_name,
         game_dir=args.game_dir,
         template_ucas_path=tmpl_path,
         cache_dir=cache_dir,
     )
 
-    print(f"Successfully built Stellar Blade Custom Camp Music Mod (all 34 original tracks preserved):")
-    for idx, trk in enumerate(custom_tracks, start=1):
-        hop_samples = max(1, round(trk.ogg_on.sample_rate * 0.01))
-        tail_guard = round(trk.ogg_on.sample_rate * (3072.0 / 48000.0))
-        nrt_frames = max(1, (trk.ogg_on.total_samples - tail_guard) // hop_samples)
+    print(f"\nSUCCESS! Added {len(all_tracks)} custom track(s) while keeping all 34 original tracks intact:")
+    for idx, trk in enumerate(individual_tracks, start=1):
         cov_note = f" | Cover: {trk.cover_label}" if trk.cover_label else ""
-        print(
-            f"  [Custom {idx:02d}] {trk.title!r} | {trk.ogg_on.sample_rate} Hz, {trk.ogg_on.channels}ch, "
-            f"{trk.ogg_on.duration:.3f}s | {nrt_frames:,} QNRT frames{cov_note}"
-        )
-    print(f"  Output Files:")
+        print(f"  [Custom {idx:02d}] {trk.title!r} ({trk.ogg_on.duration:.2f}s{cov_note})")
+    for idx, (trk, (v_title, order)) in enumerate(zip(radio_tracks, variant_logs), start=1):
+        vis_note = "Visualizer: OFF" if trk.disable_visualizer else "Visualizer: ON"
+        cov_note = f" | Cover: {trk.cover_label}" if trk.cover_label else ""
+        print(f"  [Radio  {idx:02d}] {v_title!r} ({trk.ogg_on.duration:.1f}s | {len(order)} songs | {vis_note}{cov_note})")
+        print(f"             Order: {' -> '.join(p.stem for p in order)}")
+    print("  Output Files:")
     print(f"    PAK : {pak_p} ({pak_p.stat().st_size:,} bytes)")
     print(f"    UTOC: {utoc_p} ({utoc_p.stat().st_size:,} bytes)")
     print(f"    UCAS: {ucas_p} ({ucas_p.stat().st_size:,} bytes)")

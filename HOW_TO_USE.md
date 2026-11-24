@@ -52,6 +52,32 @@ python inject_camp_music.py --gui
 
 ---
 
+### Option 2: Camp Radio & Shuffle GUI (`Launch_Radio_GUI.bat`)
+To combine folders of songs into **"Fake Radio"** stations (e.g. `Music/PopRadio/`) with pre-shuffled track order variants:
+```powershell
+.\Launch_Radio_GUI.bat
+# or:
+python radio_music_gui.py
+# or:
+python inject_camp_music.py --radio-gui
+```
+- Place each station's songs inside its own subfolder (e.g. `Music/PopRadio/Song1.ogg`, `Song2.ogg`, ...).
+- Optional cover art image in the same folder (`cover.png`, `folder.jpg`, etc.) is used automatically; if missing, it falls back to the first song's embedded cover art, then to the selected preset.
+- Set **Shuffled Variants** (e.g. `3`) to generate multiple pre-shuffled mixes (`Pop Radio #1`, `Pop Radio #2`, `Pop Radio #3`) in one mod, plus **Silence Gap (sec)** between tracks and **Visualizer** mode (`Auto (Off > 20 min)` keeps long mixes compact by emitting a ~1.2 KB silent `UConstantQNRT`).
+- Use **Also Include Custom Songs** (`./Music Folder` or `Custom GUI Playlist`) to bundle your individual custom songs alongside your radio stations and all 34 original tracks in a single mod.
+- Requires **`ffmpeg`** on `PATH` to concatenate and encode shuffled tracks into a single clean Ogg Vorbis bitstream.
+
+### CLI Radio Mode (and Combining with Individual Custom Songs)
+```powershell
+# Radio only:
+python inject_camp_music.py --radio Music/PopRadio --variants 3 --silence 0.5 --install
+
+# Default 34 tracks + all individual songs in ./Music + shuffled PopRadio variants in ONE mod:
+python inject_camp_music.py --batch Music --radio Music/PopRadio --variants 3 --silence 0.5 --install
+```
+
+---
+
 ## 4. CLI Quick Start Examples
 
 ### Add All Songs from `./Music` Into One Combined Mod
@@ -85,6 +111,15 @@ python inject_camp_music.py -i my_song_on.ogg --input-off my_song_muffled.ogg --
 | Argument | Default | Description |
 | :--- | :--- | :--- |
 | `--gui` | `False` | Launch the native Windows graphical user interface (`camp_music_gui.py`). |
+| `--radio-gui` | `False` | Launch the dedicated Windows Camp Radio & Shuffle GUI (`radio_music_gui.py`). |
+| `--radio <dir>` | `None` | Radio station folder (or parent folder containing station subfolders) to shuffle & combine into one track per variant. Repeatable; can be combined with `--batch` and `-i`. |
+| `--radio-title <text>` | Folder name | Optional custom title paired with each `--radio` station (useful when combining `--radio` with `-i --title`). |
+| `--radio-cover <path>` | Auto-detected | Optional custom cover image paired with each `--radio` station. |
+| `--variants <N>` | `1` | Number of pre-shuffled radio variants to generate per station (`Pop Radio #1`, `#2`, ...). |
+| `--silence <sec>` | `0.5` | Silence duration in seconds inserted between songs in a radio mix. |
+| `--visualizer <auto\|on\|off>` | `auto` | Turntable visualizer mode for radio mixes (`auto` disables CQT frames above threshold to save space). |
+| `--visualizer-threshold <min>` | `20.0` | Duration threshold in minutes for `--visualizer auto`. |
+| `--seed <int>` | `None` | Optional random seed for reproducible radio shuffling. |
 | `--batch [folder]` | `None` (defaults to `./Music` if flag is passed without argument) | Bundle all audio files from a folder into one combined mod while keeping all 34 original tracks. |
 | `-i`, `--input <path>` | *(Required unless `--batch`, `--gui`, or `--list-tracks`)* | Input audio file (`.ogg` used directly; `.wav`, `.mp3`, `.flac`, `.m4a` auto-converted to `48000 Hz` stereo Ogg Vorbis via `ffmpeg`). Repeat `-i` to bundle multiple tracks. |
 | `--input-off <path>` | Same as `--input` | Optional separate audio file for the `<Track>_OFF` (`NoiseMusicPath`) asset (repeatable to pair with each `-i`). |

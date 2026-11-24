@@ -12,7 +12,9 @@ No Unreal Engine installation or `pip install` dependencies are required.
 ## Features
 
 - **Preserves All 34 Original Songs**: Appends your custom tracks directly to `TurntableSoundTable.uasset` and `StringTable_UI.uasset` instead of replacing vanilla songs. Every custom song is unlocked immediately at any camp (`ConditionGroup = None`) and displays its title in every game language.
-- **Zero-Dependency Native Windows GUI**: Launch `Launch_GUI.bat` for a native Win32 desktop app (`ctypes`) with drag-and-drop support for audio files, folders, cover images, and your Stellar Blade directory.
+- **Native Windows Desktop GUIs**:
+  - `Launch_GUI.bat` (`camp_music_gui.py`) for adding individual custom songs with drag-and-drop support, audio preview, and Steam game auto-detection.
+  - `Launch_Radio_GUI.bat` (`radio_music_gui.py`) for building **"Fake Radio"** stations from folders (e.g. `Music/PopRadio/`): randomly shuffles and combines songs into one or more pre-shuffled station variants (`Pop Radio #1`, `Pop Radio #2`, ...) with custom folder/1st-song cover art, configurable silence gaps, and automatic visualizer disabling for long mixes.
 - **Full CLI Automation**: Build single-track or multi-track mods from the command line or batch-pack an entire `Music/` folder in seconds.
 - **Custom & Embedded Album Cover Art**: Automatically extracts embedded artwork (`APIC`, `METADATA_BLOCK_PICTURE`, `covr`) or accepts custom `.png`/`.jpg`/`.webp` images (packed as `256×256` `UTexture2D` assets), with 9 vanilla cover presets as fallbacks.
 - **Safe Audio Metadata Stripping**: Strips embedded pictures and Vorbis comment tags from `.ogg` audio streams before packaging so Unreal Engine's Vorbis decoder loads every track cleanly.
@@ -67,9 +69,12 @@ python inject_camp_music.py -i "my_song.ogg" --title "My Custom Song" --install
 
 | File / Folder | Purpose |
 | :--- | :--- |
-| [Launch_GUI.bat](Launch_GUI.bat) | One-click Windows launcher for the desktop GUI |
-| [camp_music_gui.py](camp_music_gui.py) | Native Win32 GUI application (`ctypes`) |
-| [inject_camp_music.py](inject_camp_music.py) | Core UE 4.26.2 Zen/IoStore builder, asset synthesizer, and CLI |
+| [Launch_GUI.bat](Launch_GUI.bat) | One-click Windows launcher for the per-song desktop GUI |
+| [Launch_Radio_GUI.bat](Launch_Radio_GUI.bat) | One-click Windows launcher for the Camp Radio & Shuffle GUI |
+| [camp_music_gui.py](camp_music_gui.py) | Native Win32 GUI application for individual tracks |
+| [radio_music_gui.py](radio_music_gui.py) | Native Win32 GUI application for shuffled Camp Radio folders |
+| [gui_common.py](gui_common.py) | Shared Win32 GUI helpers and Stellar Blade auto-detection |
+| [inject_camp_music.py](inject_camp_music.py) | Core UE 4.26.2 Zen/IoStore builder, asset synthesizer, radio mixer, and CLI |
 | [Music/](Music/) | Default drop-in folder for `--batch` and the GUI's **Load ./Music Folder** button |
 | [HOW_TO_USE.md](HOW_TO_USE.md) | Detailed user guide and full CLI flag reference |
 | [CAMP_MUSIC_INJECTION_PLAN.md](CAMP_MUSIC_INJECTION_PLAN.md) | UE 4.26.2 Zen/IoStore binary format & architecture reference |
